@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 import requests
+from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 
@@ -107,14 +108,18 @@ def extract_frames(video_path: Path, record_id: str, frame_count: int):
     metadata["frame_interval_seconds"] = interval
     return metadata, frame_urls
 
-
+class ExtractRequest(BaseModel):
+    video_url: str
+    asset_name: str = ""
+    record_id: str = ""
+    frame_count: int = 10
+    
 @app.post("/extract")
-async def extract(request: Request):
-    body = await request.json()
+async def extract(body: ExtractRequest, request: Request):
 
-    video_url = body.get("video_url")
-    record_id = body.get("record_id", str(uuid.uuid4()))
-    frame_count = int(body.get("frame_count", 10))
+    video_url = body.video_url
+    record_id = body.record_id or str(uuid.uuid4())
+    frame_count = body.frame_count
 
     if not video_url:
         raise HTTPException(status_code=400, detail="video_url is required")
