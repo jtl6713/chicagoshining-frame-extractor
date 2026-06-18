@@ -47,6 +47,71 @@ def download_video(video_url: str, output_path: Path):
                     f.write(chunk)
 
 
+def get_rotation_degrees(video_stream: dict) -> int:
+    """
+    Reads rotation metadata from ffprobe output.
+    Rotation may appear in tags.rotate or side_data_list.rotation.
+    """
+    rotation = 0
+
+    tags = video_stream.get("tags") or {}
+    if "rotate" in tags:
+        try:
+            rotation = int(float(tags["rotate"]))
+        except Exception:
+            rotation = 0
+
+    for item in video_stream.get("side_data_list") or []:
+        if "rotation" in item:
+            try:
+                rotation = int(float(item["rotation"]))
+            except Exception:
+                pass
+
+    return rotation % 360
+
+
+def get_display_dimensions(raw_width: int, raw_height: int, rotation_degrees: int):
+    """
+    If video has 90 or 270 degree display rotation, swap width and height.
+    """
+    if rotation_degrees in (90, 270):
+        return raw_height, raw_width
+    return raw_width, raw_height
+
+
+def classify_orientation_and_aspect_ratio(width: int, height: int):
+    """
+    Classifies orientation/aspect ratio from display dimensions.
+    """
+    if width <= 0 or height <= 0:
+        return "Unknown", "Unknown"
+
+    if height > width:
+        orientation = "Portrait"
+    elif width > height:
+        orientation = "Landscape"
+    else:
+        orientation = "Square"
+
+    ratio = width / height
+
+    if abs(ratio - (9 / 16)) < 0.12:
+        aspect_ratio = "9:16"
+    elif abs(ratio - (16 / 9)) < 0.12:
+        aspect_ratio = "16:9"
+    elif abs(ratio - (4 / 5)) < 0.12:
+        aspect_ratio = "4:5"
+    elif abs(ratio - 1) < 0.08:
+        aspect_ratio = "1:1"
+    elif abs(ratio - (3 / 2)) < 0.12:
+        aspect_ratio = "3:2"
+    else:
+        aspect_ratio = "Unknown"
+
+    return orientation, aspect_ratio
+
+
 def get_video_metadata(video_path: Path):
     cmd = [
         "ffprobe",
@@ -68,26 +133,38 @@ def get_video_metadata(video_path: Path):
         raise RuntimeError("No video stream found.")
 
     duration = float(data.get("format", {}).get("duration", 0))
-    width = int(video_stream.get("width", 0))
-    height = int(video_stream.get("height", 0))
 
-    if width <= 0 or height <= 0:
-        orientation = "Unknown"
-        aspect_ratio = "Unknown"
-    elif height > width:
-        orientation = "Portrait"
-        aspect_ratio = "9:16"
-    elif width > height:
-        orientation = "Landscape"
-        aspect_ratio = "16:9"
-    else:
-        orientation = "Square"
-        aspect_ratio = "1:1"
+    raw_width = int(video_stream.get("width", 0))
+    raw_height = int(video_stream.get("height", 0))
+
+    rotation_degrees = get_rotation_degrees(video_stream)
+
+    display_width, display_height = get_display_dimensions(
+        raw_width,
+        raw_height,
+        rotation_degrees
+    )
+
+    orientation, aspect_ratio = classify_orientation_and_aspect_ratio(
+        display_width,
+        display_height
+    )
 
     return {
         "duration_seconds": round(duration, 2),
-        "width": width,
-        "height": height,
+
+        # Raw encoded dimensions from the file
+        "raw_width": raw_width,
+        "raw_height": raw_height,
+        "rotation_degrees": rotation_degrees,
+
+        # Display-aware dimensions after accounting for rotation metadata
+        "display_width": display_width,
+        "display_height": display_height,
+
+        # Keep these names for your existing Make/OpenAI mappings
+        "width": display_width,
+        "height": display_height,
         "orientation": orientation,
         "aspect_ratio": aspect_ratio
     }
@@ -102,6 +179,27 @@ def get_frame_timestamps(duration: float, frame_count: int):
     frame_count = max(1, min(frame_count, len(safe_percentages)))
 
     return [round(duration * pct, 2) for pct in safe_percentages[:frame_count]]
+
+
+def build_video_filter(rotation_degrees: int, max_width: int) -> str:
+    """
+    Builds an ffmpeg video filter.
+
+    - Applies rotation manually when rotation metadata exists.
+    - Then scales down to max_width while preserving aspect ratio.
+    """
+    vf_parts = []
+
+    if rotation_degrees == 90:
+        vf_parts.append("transpose=1")
+    elif rotation_degrees == 270:
+        vf_parts.append("transpose=2")
+    elif rotation_degrees == 180:
+        vf_parts.append("transpose=1,transpose=1")
+
+    vf_parts.append(f"scale='min({max_width},iw)':-2")
+
+    return ",".join(vf_parts)
 
 
 def extract_frames(
@@ -119,12 +217,19 @@ def extract_frames(
 
     # Safety caps for Render memory/disk.
     frame_count = max(1, min(frame_count, 8))
+
+    # ffmpeg q:v uses lower numbers for higher quality.
+    # Your Make scenario sends 70, so this clamps it safely.
     frame_quality = max(2, min(frame_quality, 31))
+
     max_width = max(480, min(max_width, 1920))
 
     timestamps = get_frame_timestamps(duration, frame_count)
 
     frame_urls = []
+
+    rotation_degrees = metadata.get("rotation_degrees", 0)
+    vf_filter = build_video_filter(rotation_degrees, max_width)
 
     for i, timestamp in enumerate(timestamps, start=1):
         frame_name = f"{record_id}_frame_{i:02d}_{uuid.uuid4().hex[:8]}.jpg"
@@ -133,10 +238,11 @@ def extract_frames(
         cmd = [
             "ffmpeg",
             "-y",
+            "-noautorotate",
             "-ss", str(timestamp),
             "-i", str(video_path),
             "-frames:v", "1",
-            "-vf", f"scale='min({max_width},iw)':-2",
+            "-vf", vf_filter,
             "-q:v", str(frame_quality),
             str(frame_path)
         ]
