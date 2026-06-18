@@ -56,7 +56,8 @@ def download_video(video_url: str, output_path: Path):
 def classify_orientation_and_aspect_ratio(width: int, height: int):
     """
     Classifies orientation/aspect ratio from display dimensions.
-    Includes 3:4 for high-res DJI portrait photos like 6144 x 8192.
+    Uses closest-match logic so 6144 x 8192 correctly becomes 3:4,
+    not 4:5.
     """
     if width <= 0 or height <= 0:
         return "Unknown", "Unknown"
@@ -70,18 +71,28 @@ def classify_orientation_and_aspect_ratio(width: int, height: int):
 
     ratio = width / height
 
-    if abs(ratio - (9 / 16)) < 0.12:
-        aspect_ratio = "9:16"
-    elif abs(ratio - (16 / 9)) < 0.12:
-        aspect_ratio = "16:9"
-    elif abs(ratio - (4 / 5)) < 0.12:
-        aspect_ratio = "4:5"
-    elif abs(ratio - (3 / 4)) < 0.12:
-        aspect_ratio = "3:4"
-    elif abs(ratio - 1) < 0.08:
-        aspect_ratio = "1:1"
-    elif abs(ratio - (3 / 2)) < 0.12:
-        aspect_ratio = "3:2"
+    known_ratios = {
+        "9:16": 9 / 16,
+        "16:9": 16 / 9,
+        "4:5": 4 / 5,
+        "3:4": 3 / 4,
+        "4:3": 4 / 3,
+        "1:1": 1,
+        "3:2": 3 / 2,
+    }
+
+    closest_label = "Unknown"
+    closest_diff = 999
+
+    for label, target_ratio in known_ratios.items():
+        diff = abs(ratio - target_ratio)
+        if diff < closest_diff:
+            closest_diff = diff
+            closest_label = label
+
+    # Keep this tight enough that odd ratios do not get forced incorrectly.
+    if closest_diff <= 0.03:
+        aspect_ratio = closest_label
     else:
         aspect_ratio = "Unknown"
 
