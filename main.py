@@ -11,6 +11,7 @@ import requests
 from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
+from PIL import Image, ImageOps
 
 app = FastAPI()
 
@@ -180,37 +181,31 @@ def get_video_metadata(video_path: Path):
 
 def get_image_metadata(image_path: Path):
     """
-    Uses ffprobe to read exact image dimensions.
-    This is more reliable than asking OpenAI to infer pixel size.
+    Reads exact displayed image dimensions using Pillow.
+
+    Image.open() reads the raw encoded size.
+    ImageOps.exif_transpose() applies EXIF orientation, which is critical for DJI/phone photos
+    that may be stored as landscape but displayed as portrait.
     """
-    cmd = [
-        "ffprobe",
-        "-v", "quiet",
-        "-print_format", "json",
-        "-show_streams",
-        str(image_path)
-    ]
+    with Image.open(image_path) as img:
+        raw_width, raw_height = img.size
 
-    data = json.loads(run_cmd(cmd))
+        # Apply EXIF orientation so the dimensions match how the image displays.
+        display_img = ImageOps.exif_transpose(img)
+        display_width, display_height = display_img.size
 
-    image_stream = next(
-        (s for s in data.get("streams", []) if s.get("codec_type") == "video"),
-        None
+    orientation, aspect_ratio = classify_orientation_and_aspect_ratio(
+        display_width,
+        display_height
     )
 
-    if not image_stream:
-        raise RuntimeError("No image stream found.")
-
-    width = int(image_stream.get("width", 0))
-    height = int(image_stream.get("height", 0))
-
-    orientation, aspect_ratio = classify_orientation_and_aspect_ratio(width, height)
-
     return {
-        "width": width,
-        "height": height,
-        "image_width": width,
-        "image_height": height,
+        "raw_width": raw_width,
+        "raw_height": raw_height,
+        "width": display_width,
+        "height": display_height,
+        "image_width": display_width,
+        "image_height": display_height,
         "orientation": orientation,
         "aspect_ratio": aspect_ratio
     }
