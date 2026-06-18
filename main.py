@@ -33,18 +33,58 @@ def run_cmd(cmd):
     return result.stdout
 
 
-def download_video(video_url: str, output_path: Path):
-    with requests.get(video_url, stream=True, timeout=180, allow_redirects=True) as r:
+def download_file(file_url: str, output_path: Path):
+    with requests.get(file_url, stream=True, timeout=180, allow_redirects=True) as r:
         if r.status_code != 200:
             raise HTTPException(
                 status_code=400,
-                detail=f"Could not download video. Status: {r.status_code}"
+                detail=f"Could not download file. Status: {r.status_code}"
             )
 
         with open(output_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
+
+
+# Backward-compatible alias for your existing video flow.
+def download_video(video_url: str, output_path: Path):
+    download_file(video_url, output_path)
+
+
+def classify_orientation_and_aspect_ratio(width: int, height: int):
+    """
+    Classifies orientation/aspect ratio from display dimensions.
+    Includes 3:4 for high-res DJI portrait photos like 6144 x 8192.
+    """
+    if width <= 0 or height <= 0:
+        return "Unknown", "Unknown"
+
+    if height > width:
+        orientation = "Portrait"
+    elif width > height:
+        orientation = "Landscape"
+    else:
+        orientation = "Square"
+
+    ratio = width / height
+
+    if abs(ratio - (9 / 16)) < 0.12:
+        aspect_ratio = "9:16"
+    elif abs(ratio - (16 / 9)) < 0.12:
+        aspect_ratio = "16:9"
+    elif abs(ratio - (4 / 5)) < 0.12:
+        aspect_ratio = "4:5"
+    elif abs(ratio - (3 / 4)) < 0.12:
+        aspect_ratio = "3:4"
+    elif abs(ratio - 1) < 0.08:
+        aspect_ratio = "1:1"
+    elif abs(ratio - (3 / 2)) < 0.12:
+        aspect_ratio = "3:2"
+    else:
+        aspect_ratio = "Unknown"
+
+    return orientation, aspect_ratio
 
 
 def get_rotation_degrees(video_stream: dict) -> int:
@@ -78,38 +118,6 @@ def get_display_dimensions(raw_width: int, raw_height: int, rotation_degrees: in
     if rotation_degrees in (90, 270):
         return raw_height, raw_width
     return raw_width, raw_height
-
-
-def classify_orientation_and_aspect_ratio(width: int, height: int):
-    """
-    Classifies orientation/aspect ratio from display dimensions.
-    """
-    if width <= 0 or height <= 0:
-        return "Unknown", "Unknown"
-
-    if height > width:
-        orientation = "Portrait"
-    elif width > height:
-        orientation = "Landscape"
-    else:
-        orientation = "Square"
-
-    ratio = width / height
-
-    if abs(ratio - (9 / 16)) < 0.12:
-        aspect_ratio = "9:16"
-    elif abs(ratio - (16 / 9)) < 0.12:
-        aspect_ratio = "16:9"
-    elif abs(ratio - (4 / 5)) < 0.12:
-        aspect_ratio = "4:5"
-    elif abs(ratio - 1) < 0.08:
-        aspect_ratio = "1:1"
-    elif abs(ratio - (3 / 2)) < 0.12:
-        aspect_ratio = "3:2"
-    else:
-        aspect_ratio = "Unknown"
-
-    return orientation, aspect_ratio
 
 
 def get_video_metadata(video_path: Path):
@@ -165,6 +173,44 @@ def get_video_metadata(video_path: Path):
         # Keep these names for your existing Make/OpenAI mappings
         "width": display_width,
         "height": display_height,
+        "orientation": orientation,
+        "aspect_ratio": aspect_ratio
+    }
+
+
+def get_image_metadata(image_path: Path):
+    """
+    Uses ffprobe to read exact image dimensions.
+    This is more reliable than asking OpenAI to infer pixel size.
+    """
+    cmd = [
+        "ffprobe",
+        "-v", "quiet",
+        "-print_format", "json",
+        "-show_streams",
+        str(image_path)
+    ]
+
+    data = json.loads(run_cmd(cmd))
+
+    image_stream = next(
+        (s for s in data.get("streams", []) if s.get("codec_type") == "video"),
+        None
+    )
+
+    if not image_stream:
+        raise RuntimeError("No image stream found.")
+
+    width = int(image_stream.get("width", 0))
+    height = int(image_stream.get("height", 0))
+
+    orientation, aspect_ratio = classify_orientation_and_aspect_ratio(width, height)
+
+    return {
+        "width": width,
+        "height": height,
+        "image_width": width,
+        "image_height": height,
         "orientation": orientation,
         "aspect_ratio": aspect_ratio
     }
@@ -280,6 +326,16 @@ class ExtractRequest(BaseModel):
     max_width: int = 1280
 
 
+class ImageMetadataRequest(BaseModel):
+    download_url: Optional[str] = None
+    image_url: Optional[str] = None
+    google_drive_file_id: Optional[str] = None
+    asset_name: str = ""
+    record_id: str = ""
+    mime_type: Optional[str] = None
+    file_size_mb: Optional[str] = None
+
+
 @app.post("/extract")
 async def extract(body: ExtractRequest, request: Request):
     record_id = body.record_id or str(uuid.uuid4())
@@ -335,6 +391,52 @@ async def extract(body: ExtractRequest, request: Request):
     finally:
         if video_path.exists():
             video_path.unlink()
+
+
+@app.post("/image-metadata")
+async def image_metadata(body: ImageMetadataRequest):
+    record_id = body.record_id or str(uuid.uuid4())
+
+    image_url = body.download_url or body.image_url
+
+    if not image_url:
+        raise HTTPException(
+            status_code=400,
+            detail="download_url or image_url is required"
+        )
+
+    job_id = str(uuid.uuid4())
+    image_path = TMP_DIR / f"{job_id}.image"
+
+    try:
+        download_file(image_url, image_path)
+
+        metadata = get_image_metadata(image_path)
+
+        return {
+            "success": True,
+            "record_id": record_id,
+            "asset_name": body.asset_name,
+            "google_drive_file_id": body.google_drive_file_id,
+            "mime_type": body.mime_type,
+            "file_size_mb": body.file_size_mb,
+            **metadata
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "record_id": record_id,
+                "asset_name": body.asset_name,
+                "error": str(e)
+            }
+        )
+
+    finally:
+        if image_path.exists():
+            image_path.unlink()
 
 
 @app.get("/")
